@@ -1,0 +1,4 @@
+[plugin]
+description = "depl state store: ownership records, settings and the run lock"
+version = "0.1.0"
+[plugin.config]

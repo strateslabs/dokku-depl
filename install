@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Creates the state directory only. State itself is made by depl:init: plugin:install
+# with no arguments re-runs every install trigger, and must not recreate lost state.
+set -eo pipefail
+dir="${DOKKU_LIB_ROOT:-/var/lib/dokku}/data/depl"
+mkdir -p "$dir"
+chmod 700 "$dir"
+if [[ "$(id -u)" == 0 ]]; then
+  chown "${DOKKU_SYSTEM_USER:-dokku}:${DOKKU_SYSTEM_GROUP:-dokku}" "$dir"
+fi

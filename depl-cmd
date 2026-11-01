@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# Every depl:* subcommand. subcommands/<name> are symlinks to this file, so the
+# name comes from how it was invoked. Plain bash and jq: Dokku's package needs
+# both jq and util-linux (flock).
+# shellcheck disable=SC2016  # jq programs are single-quoted on purpose
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+umask 077
+
+PLUGIN_VERSION="0.1.0"
+STATE_FORMAT=1
+ROOT="${DOKKU_LIB_ROOT:-/var/lib/dokku}/data/depl"
+STATE="$ROOT/state.json"
+LOCK="$ROOT/lock.json"
+DEFAULT_TTL=600
+KINDS=" app postgres redis volume network plugin "
+
+die() {
+  local code="$1"
+  shift
+  echo "depl: $*" >&2
+  exit "$code"
+}
+
+# Writers hold this for the whole command; readers rely on atomic renames.
+take_flock() {
+  mkdir -p "$ROOT"
+  exec 9>>"$ROOT/.flock"
+  flock -x 9
+}
+
+# atomic_write FILE JQ_ARGS...: write jq's output to FILE through a temp file and mv.
+atomic_write() {
+  local file="$1" tmp
+  shift
+  tmp="$(mktemp "$ROOT/.tmp.XXXXXX")"
+  if ! jq "$@" >"$tmp"; then
+    rm -f "$tmp"
+    die 1 "could not write $file"
+  fi
+  mv -f "$tmp" "$file"
+}
+
+load_state() {
+  [[ -e "$STATE" ]] || die 20 "state is missing ($STATE); run depl:init"
+  local format
+  format="$(jq -e '.format | select(type == "number" and . == floor)' "$STATE" 2>/dev/null)" || die 21 "state is unreadable ($STATE)"
+  ((format <= STATE_FORMAT)) || die 22 "state format $format is newer than this plugin reads ($STATE_FORMAT); update the plugin"
+  if ((format < 1)) || ! jq -e '(.records | type == "object") and (.kv | type == "object")' "$STATE" >/dev/null 2>&1; then
+    die 21 "state is unreadable ($STATE)"
+  fi
+}
+
+need_args() {
+  local want="$1" have="$2"
+  ((have == want)) || die 1 "expected $want argument(s), got $have"
+}
+
+check_kind() { [[ "$KINDS" == *" $1 "* ]] || die 1 "unknown kind '$1'"; }
+check_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die 1 "invalid name '$1'"; }
+check_text() { [[ -n "$1" && ${#1} -le 200 ]] || die 1 "invalid $2"; }
+check_ttl() { [[ "$1" =~ ^[1-9][0-9]*$ ]] || die 1 "invalid ttl '$1'"; }
+
+# The lock with the server-side expiry verdict added.
+show_lock() { jq -c '. + {expired: ((.expires_at | fromdateiso8601) <= now)}' "$LOCK"; }
+
+load_lock() {
+  [[ -e "$LOCK" ]] || return 1
+  jq -e '.run_id | strings' "$LOCK" >/dev/null 2>&1 || die 21 "lock is unreadable ($LOCK)"
+}
+
+holder_is() { [[ "$(jq -r .run_id "$LOCK")" == "$1" ]]; }
+
+cmd_version() { printf '{"plugin":"%s","state_format":%s}\n' "$PLUGIN_VERSION" "$STATE_FORMAT"; }
+
+cmd_init() {
+  local force=""
+  if [[ "${1:-}" == "--force" ]]; then
+    force=1
+    shift
+  fi
+  need_args 0 $#
+  take_flock
+  if [[ -e "$STATE" ]]; then
+    [[ -n "$force" ]] || die 23 "state already exists ($STATE)"
+    mv -f "$STATE" "$STATE.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+  fi
+  atomic_write "$STATE" -n --argjson f "$STATE_FORMAT" '{format: $f, records: {}, kv: {}}'
+}
+
+cmd_state_status() { load_state; }
+
+cmd_state_list() {
+  load_state
+  jq -c '{format, records: ([.records[]] | sort_by(.kind, .name))}' "$STATE"
+}
+
+cmd_state_get() {
+  need_args 2 $#
+  check_kind "$1"
+  check_name "$2"
+  load_state
+  jq -ce --arg k "$1/$2" '.records[$k] // empty' "$STATE" || exit 3
+}
+
+cmd_state_set() {
+  need_args 3 $#
+  check_kind "$1"
+  check_name "$2"
+  [[ "$3" == owned || "$3" == retained ]] || die 1 "invalid status '$3'"
+  take_flock
+  load_state
+  atomic_write "$STATE" --arg k "$1/$2" --arg kind "$1" --arg name "$2" --arg status "$3" \
+    '(now | floor | todate) as $t | .records[$k] = {kind: $kind, name: $name, status: $status,
+      created_at: (.records[$k].created_at // $t), updated_at: $t}' "$STATE"
+  jq -c --arg k "$1/$2" '.records[$k]' "$STATE"
+}
+
+cmd_state_rm() {
+  need_args 2 $#
+  check_kind "$1"
+  check_name "$2"
+  take_flock
+  load_state
+  atomic_write "$STATE" --arg k "$1/$2" 'del(.records[$k])' "$STATE"
+}
+
+check_key() { [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || die 1 "invalid key '$1'"; }
+
+cmd_kv_get() {
+  need_args 1 $#
+  check_key "$1"
+  load_state
+  local value
+  value="$(jq -r --arg k "$1" '.kv[$k] // empty' "$STATE")"
+  [[ -n "$value" ]] || exit 3
+  printf '%s\n' "$value"
+}
+
+cmd_kv_set() {
+  need_args 2 $#
+  check_key "$1"
+  [[ -n "$2" ]] || die 1 "empty value; use depl:kv-rm to remove a key"
+  take_flock
+  load_state
+  atomic_write "$STATE" --arg k "$1" --arg v "$2" '.kv[$k] = $v' "$STATE"
+}
+
+cmd_kv_rm() {
+  need_args 1 $#
+  check_key "$1"
+  take_flock
+  load_state
+  atomic_write "$STATE" --arg k "$1" 'del(.kv[$k])' "$STATE"
+}
+
+cmd_lock_acquire() {
+  (($# == 4 || $# == 5)) || die 1 "usage: lock-acquire <run-id> <user> <machine> <started-at> [<ttl>]"
+  local id="$1" user="$2" machine="$3" started="$4" ttl="${5:-$DEFAULT_TTL}"
+  check_text "$id" run-id
+  check_text "$user" user
+  check_text "$machine" machine
+  [[ "$started" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || die 1 "invalid started-at '$started'"
+  check_ttl "$ttl"
+  take_flock
+  if load_lock; then
+    if ! holder_is "$id" && [[ "$(show_lock | jq .expired)" == false ]]; then
+      echo "depl: lock held by $(show_lock)" >&2
+      exit 30
+    fi
+    # The same run acquiring again keeps its original start time.
+    if holder_is "$id"; then started="$(jq -r .started_at "$LOCK")"; fi
+  fi
+  write_lock "$id" "$user" "$machine" "$started" "$ttl"
+  show_lock
+}
+
+write_lock() {
+  atomic_write "$LOCK" -n --arg id "$1" --arg user "$2" --arg machine "$3" --arg started "$4" --argjson ttl "$5" \
+    '(now | floor) as $n | {run_id: $id, user: $user, machine: $machine, started_at: $started,
+      refreshed_at: ($n | todate), expires_at: ($n + $ttl | todate), ttl: $ttl}'
+}
+
+cmd_lock_refresh() {
+  (($# == 1 || $# == 2)) || die 1 "usage: lock-refresh <run-id> [<ttl>]"
+  take_flock
+  if ! load_lock || ! holder_is "$1"; then die 31 "lock is not held by run $1"; fi
+  local ttl="${2:-$(jq -r .ttl "$LOCK")}"
+  check_ttl "$ttl"
+  write_lock "$1" "$(jq -r .user "$LOCK")" "$(jq -r .machine "$LOCK")" "$(jq -r .started_at "$LOCK")" "$ttl"
+  show_lock
+}
+
+cmd_lock_release() {
+  need_args 1 $#
+  take_flock
+  load_lock || return 0
+  holder_is "$1" || die 31 "lock is not held by run $1"
+  rm -f "$LOCK"
+}
+
+cmd_lock_show() {
+  need_args 0 $#
+  load_lock || exit 3
+  show_lock
+}
+
+cmd_lock_force_release() {
+  need_args 1 $#
+  take_flock
+  load_lock || exit 3
+  holder_is "$1" || die 31 "lock is not held by run $1"
+  rm -f "$LOCK"
+}
+
+main() {
+  local name
+  case "$(basename "$0")" in
+    depl-cmd)
+      name="${1:-}"
+      shift || true
+      ;;
+    *)
+      name="$(basename "$0")"
+      if [[ "${1:-}" == depl:* ]]; then shift; fi
+      ;;
+  esac
+  name="${name#depl:}"
+  case "$name" in
+    version | init | state-status | state-list | state-get | state-set | state-rm | kv-get | kv-set | kv-rm | \
+      lock-acquire | lock-refresh | lock-release | lock-show | lock-force-release)
+      "cmd_${name//-/_}" "$@"
+      ;;
+    *) die 1 "unknown command '$name'" ;;
+  esac
+}
+
+main "$@"
