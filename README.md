@@ -34,7 +34,7 @@ Every command runs as the `dokku` user, locally as `dokku depl:<subcommand>` or 
 | `depl:lock-show` | the lock, JSON | The current holder. Exit 3 when there is no lock |
 | `depl:lock-force-release <run-id>` | none | Release a lock on behalf of its holder (the operator's `depl unlock <run-id>`). Exit 3 when there is no lock, 31 when `<run-id>` is not the holder |
 
-`depl:help` lists the commands. The state and `kv-*` commands fail with 20, 21 or 22 when state is missing, unreadable or too new; the lock commands do not need state.
+`depl:help` lists the commands. Each `subcommands/<name>` file is a link to the one script, `depl-cmd`.
 
 ### Arguments
 
@@ -98,7 +98,7 @@ Everything lives in `$DOKKU_LIB_ROOT/data/depl/` (`/var/lib/dokku/data/depl/`), 
 
 ```bash
 bats tests          # needs bats-core, jq and flock (Linux)
-shellcheck commands install subcommands/* functions
+shellcheck depl-cmd commands install
 ```
 
 CI runs both on every push and pull request. Changes after the first commit go through pull requests; releases are git tags (`v0.1.0`), and `plugin.toml`'s `version` matches the tag without the `v`.

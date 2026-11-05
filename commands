@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Dokku runs this for any command no subcommand file claimed: answer help only.
+set -eo pipefail
+case "${1:-}" in
+  help | depl | depl:default | depl:help) ;;
+  *) exit "${DOKKU_NOT_IMPLEMENTED_EXIT:-10}" ;;
+esac
+cat <<'HELP'
+    depl:version, Plugin version and state format
+    depl:init [--force], Create empty state
+    depl:state-status, Check that state is present and readable
+    depl:state-list, List every ownership record as JSON
+    depl:state-get|state-set|state-rm <kind> <name> [<status>], One ownership record
+    depl:kv-get|kv-set|kv-rm <key> [<value>], depl settings
+    depl:lock-acquire|lock-refresh|lock-release|lock-show|lock-force-release, The run lock
+HELP
